@@ -17,33 +17,27 @@ func DialSerial(ctx context.Context, dialer Dialer, network string, destination 
 	if parallelDialer, isParallel := dialer.(ParallelDialer); isParallel {
 		return parallelDialer.DialParallel(ctx, network, destination, destinationAddresses)
 	}
-	var conn net.Conn
-	var err error
-	var connErrors []error
+	length := len(destinationAddresses)
+	group := newTCPConnGroup(length)
 	for _, address := range destinationAddresses {
-		conn, err = dialer.DialContext(ctx, network, M.SocksaddrFrom(address, destination.Port))
-		if err != nil {
-			connErrors = append(connErrors, err)
-			continue
-		}
-		return conn, nil
+		go func(address netip.Addr) {
+			conn, err := dialer.DialContext(ctx, network, M.SocksaddrFrom(address, destination.Port))
+			group.add(conn, err)
+		}(address)
 	}
-	return nil, E.Errors(connErrors...)
+	return group.wait()
 }
 
 func ListenSerial(ctx context.Context, dialer Dialer, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.PacketConn, netip.Addr, error) {
-	var conn net.PacketConn
-	var err error
-	var connErrors []error
+	length := len(destinationAddresses)
+	group := newUDPConnGroup(length)
 	for _, address := range destinationAddresses {
-		conn, err = dialer.ListenPacket(ctx, M.SocksaddrFrom(address, destination.Port))
-		if err != nil {
-			connErrors = append(connErrors, err)
-			continue
-		}
-		return conn, address, nil
+		go func(address netip.Addr) {
+			conn, err := dialer.ListenPacket(ctx, M.SocksaddrFrom(address, destination.Port))
+			group.add(conn, address, err)
+		}(address)
 	}
-	return nil, netip.Addr{}, E.Errors(connErrors...)
+	return group.wait()
 }
 
 func DialParallel(ctx context.Context, dialer Dialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, preferIPv6 bool, fallbackDelay time.Duration) (net.Conn, error) {
@@ -124,4 +118,87 @@ func DialParallel(ctx context.Context, dialer Dialer, network string, destinatio
 			}
 		}
 	}
+}
+
+type tcpConn struct {
+	conn net.Conn
+	err  error
+}
+
+type tcpConnGroup struct {
+	count   int
+	channel chan tcpConn
+}
+
+func newTCPConnGroup(count int) tcpConnGroup {
+	return tcpConnGroup{count, make(chan tcpConn, count)}
+}
+
+func (g *tcpConnGroup) add(conn net.Conn, err error) {
+	g.channel <- tcpConn{conn, err}
+}
+
+func (g *tcpConnGroup) wait() (net.Conn, error) {
+	var i int
+	var errors []error
+	defer func() {
+		go g.close(i)
+	}()
+	for i = 0; i < g.count; i++ {
+		tc := <-g.channel
+		if tc.err == nil {
+			return tc.conn, nil
+		}
+		errors = append(errors, tc.err)
+	}
+	return nil, E.Errors(errors...)
+}
+
+func (g *tcpConnGroup) close(index int) {
+	for i := index + 1; i < g.count; i++ {
+		<-g.channel
+	}
+	close(g.channel)
+}
+
+type udpConn struct {
+	conn net.PacketConn
+	addr netip.Addr
+	err  error
+}
+
+type udpConnGroup struct {
+	count   int
+	channel chan udpConn
+}
+
+func newUDPConnGroup(count int) udpConnGroup {
+	return udpConnGroup{count, make(chan udpConn)}
+}
+
+func (g *udpConnGroup) add(conn net.PacketConn, addr netip.Addr, err error) {
+	g.channel <- udpConn{conn, addr, err}
+}
+
+func (g *udpConnGroup) wait() (net.PacketConn, netip.Addr, error) {
+	var i int
+	var errors []error
+	defer func() {
+		go g.close(i)
+	}()
+	for i = 0; i < g.count; i++ {
+		uc := <-g.channel
+		if uc.err == nil {
+			return uc.conn, uc.addr, nil
+		}
+		errors = append(errors, uc.err)
+	}
+	return nil, netip.Addr{}, E.Errors(errors...)
+}
+
+func (g *udpConnGroup) close(index int) {
+	for i := index + 1; i < g.count; i++ {
+		<-g.channel
+	}
+	close(g.channel)
 }
